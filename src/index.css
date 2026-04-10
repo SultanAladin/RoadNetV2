@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --color-neutral-950: #0a0a0a;
+  --color-neutral-900: #1a1a1a;
+  --color-neutral-800: #2a2a2a;
+  --color-neutral-700: #444444;
+  --color-neutral-600: #666666;
+  --color-neutral-400: #888888;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background-color: #0a0a0a;
+}

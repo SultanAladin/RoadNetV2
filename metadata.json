@@ -1,0 +1,5 @@
+{
+  "name": "Roadnet Spline Editor",
+  "description": "A dark-themed spline editor for drawing road networks using bezier curves with draw, select, and pan modes.",
+  "requestFramePermissions": []
+}
