@@ -170,6 +170,43 @@ export function sample_bezier_quadratic(p0: Vec3, p1: Vec3, p2: Vec3, count: num
     return result;
 }
 
+export function create_radial_curve(center: Vec3, edge: Vec3, dz: number, count: number): Vec3[] {
+    const dist = Math.sqrt((edge[0] - center[0])**2 + (edge[1] - center[1])**2);
+    if (dist === 0) return sample_linear(center, edge, count);
+    const handle_len = dist / 3;
+    const dirX = (center[0] - edge[0]) / dist;
+    const dirY = (center[1] - edge[1]) / dist;
+    const p2: Vec3 = [
+        edge[0] + dirX * handle_len,
+        edge[1] + dirY * handle_len,
+        edge[2] - dz * handle_len
+    ];
+    const p1: Vec3 = [
+        center[0] - dirX * handle_len,
+        center[1] - dirY * handle_len,
+        center[2]
+    ];
+    return sample_bezier_cubic(center, p1, p2, edge, count);
+}
+
+export function sample_bezier_cubic(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, count: number): Vec3[] {
+    const result: Vec3[] = [];
+    for (let i = 0; i < count; i++) {
+        const t = i / (count - 1);
+        const mt = 1.0 - t;
+        const w0 = mt * mt * mt;
+        const w1 = 3 * mt * mt * t;
+        const w2 = 3 * mt * t * t;
+        const w3 = t * t * t;
+        result.push([
+            w0 * p0[0] + w1 * p1[0] + w2 * p2[0] + w3 * p3[0],
+            w0 * p0[1] + w1 * p1[1] + w2 * p2[1] + w3 * p3[1],
+            w0 * p0[2] + w1 * p1[2] + w2 * p2[2] + w3 * p3[2]
+        ]);
+    }
+    return result;
+}
+
 export function coons_patch(bottom: Vec3[], top: Vec3[], left: Vec3[], right: Vec3[]): Vec3[][] {
     const u_div = bottom.length - 1;
     const v_div = left.length - 1;
@@ -242,6 +279,8 @@ export interface ArmSpec {
     width: number;
     pavement_width_left: number;
     pavement_width_right: number;
+    slope?: number;
+    getZAtRadius?: (r: number) => { z: number, dz: number };
 }
 
 export interface PatchSpec {
@@ -267,7 +306,8 @@ export interface ArmBoundary {
 }
 
 export class RoadSegmentGenerator {
-    width: number;
+    widthStart: number;
+    widthEnd: number;
     pave_left: number;
     pave_right: number;
     bridge_depth: number;
@@ -277,7 +317,8 @@ export class RoadSegmentGenerator {
     guard_rail_thickness: number;
 
     constructor(
-        width: number = 10.0,
+        widthStart: number = 10.0,
+        widthEnd: number = 10.0,
         pave_left: number = 2.0,
         pave_right: number = 2.0,
         bridge_depth: number = 1.5,
@@ -286,7 +327,8 @@ export class RoadSegmentGenerator {
         guard_rail_height: number = 0.8,
         guard_rail_thickness: number = 0.2
     ) {
-        this.width = width;
+        this.widthStart = widthStart;
+        this.widthEnd = widthEnd;
         this.pave_left = pave_left;
         this.pave_right = pave_right;
         this.bridge_depth = bridge_depth;
@@ -296,21 +338,28 @@ export class RoadSegmentGenerator {
         this.guard_rail_thickness = guard_rail_thickness;
     }
 
-    build_segment(curve: Vec3[], fill_color: string = "#333333"): { patches: PatchSpec[] } {
+    build_segment(curve: Vec3[], startDir?: Vec3, endDir?: Vec3, fill_color: string = "#333333"): { patches: PatchSpec[] } {
         if (curve.length < 2) return { patches: [] };
 
         const patches: PatchSpec[] = [];
         const N = curve.length;
 
+        const lengths = [0];
+        for (let i = 1; i < N; i++) {
+            lengths.push(lengths[i-1] + Math.hypot(curve[i][0] - curve[i-1][0], curve[i][1] - curve[i-1][1]));
+        }
+        const total_len = lengths[N - 1];
+
         const tangents: Vec3[] = [];
         const normals: Vec3[] = [];
+        const half_w: number[] = [];
 
         for (let i = 0; i < N; i++) {
             let t: Vec3;
             if (i === 0) {
-                t = v_norm(v_sub(curve[1], curve[0]));
+                t = startDir ? startDir : v_norm(v_sub(curve[1], curve[0]));
             } else if (i === N - 1) {
-                t = v_norm(v_sub(curve[N - 1], curve[N - 2]));
+                t = endDir ? endDir : v_norm(v_sub(curve[N - 1], curve[N - 2]));
             } else {
                 t = v_norm(v_sub(curve[i + 1], curve[i - 1]));
             }
@@ -319,19 +368,21 @@ export class RoadSegmentGenerator {
             const n = v_norm([-t[1], t[0], 0]);
             tangents.push(t);
             normals.push(n);
+
+            const t_len = total_len > 0 ? lengths[i] / total_len : 0;
+            half_w.push((this.widthStart * (1 - t_len) + this.widthEnd * t_len) / 2);
         }
 
-        const half_w = this.width / 2;
         const pave_l = this.pave_left;
         const pave_r = this.pave_right;
 
         // Generate lines
         const center_line = curve;
-        const left_inner = curve.map((p, i) => v_add(p, v_scale(normals[i], half_w)));
-        const right_inner = curve.map((p, i) => v_add(p, v_scale(normals[i], -half_w)));
+        const left_inner = curve.map((p, i) => v_add(p, v_scale(normals[i], half_w[i])));
+        const right_inner = curve.map((p, i) => v_add(p, v_scale(normals[i], -half_w[i])));
         
-        const left_outer = curve.map((p, i) => v_add(p, v_scale(normals[i], half_w + pave_l)));
-        const right_outer = curve.map((p, i) => v_add(p, v_scale(normals[i], -(half_w + pave_r))));
+        const left_outer = curve.map((p, i) => v_add(p, v_scale(normals[i], half_w[i] + pave_l)));
+        const right_outer = curve.map((p, i) => v_add(p, v_scale(normals[i], -(half_w[i] + pave_r))));
 
         // Road Surface
         patches.push({
@@ -479,7 +530,7 @@ export class NWayJunctionGenerator {
         this.fillet_radius = fillet_radius;
     }
 
-    build_case(arms: ArmSpec[], intersection_height: number = 0, guardRailHeight: number = 0.8, guardRailThickness: number = 0.2, bridge_depth: number = 1.5, bridge_inset: number = 1.5): { patches: PatchSpec[], armData: { id: string, R: number, MC: Vec3 }[] } {
+    build_case(arms: ArmSpec[], intersection_height: number = 0, guardRailHeight: number = 0.8, guardRailThickness: number = 0.2, bridge_depth: number = 1.5, bridge_inset: number = 1.5): { patches: PatchSpec[], armData: { id: string, R: number, MC: Vec3, D: Vec3 }[] } {
         const sorted_arms = [...arms].sort((a, b) => a.angle_deg - b.angle_deg);
         const N = sorted_arms.length;
         
@@ -509,12 +560,14 @@ export class NWayJunctionGenerator {
             const p1 = v_add(this.center, v_scale(Norm[i], HalfW[i]));
             const p2 = v_add(this.center, v_scale(Norm[next_idx], -HalfW[next_idx]));
             let c_point: Vec3;
-            if (Math.abs(det) < 1e-6) {
+            if (Math.abs(det) < 1e-4) {
                 c_point = v_add(p1, v_scale(d1, HalfW[i] * 2));
             } else {
                 const dx = p2[0] - p1[0];
                 const dy = p2[1] - p1[1];
-                const t1 = (dx * d2[1] - dy * d2[0]) / det;
+                let t1 = (dx * d2[1] - dy * d2[0]) / det;
+                if (t1 > 50.0) t1 = 50.0;
+                if (t1 < -50.0) t1 = -50.0;
                 c_point = v_add(p1, v_scale(d1, t1));
             }
             c_point[2] = 0;
@@ -524,12 +577,14 @@ export class NWayJunctionGenerator {
             const p1_outer = v_add(this.center, v_scale(Norm[i], HalfW[i] + PaveL[i]));
             const p2_outer = v_add(this.center, v_scale(Norm[next_idx], -(HalfW[next_idx] + PaveR[next_idx])));
             let c_outer_point: Vec3;
-            if (Math.abs(det) < 1e-6) {
+            if (Math.abs(det) < 1e-4) {
                 c_outer_point = v_add(p1_outer, v_scale(d1, (HalfW[i] + PaveL[i]) * 2));
             } else {
                 const dx = p2_outer[0] - p1_outer[0];
                 const dy = p2_outer[1] - p1_outer[1];
-                const t1 = (dx * d2[1] - dy * d2[0]) / det;
+                let t1 = (dx * d2[1] - dy * d2[0]) / det;
+                if (t1 > 50.0) t1 = 50.0;
+                if (t1 < -50.0) t1 = -50.0;
                 c_outer_point = v_add(p1_outer, v_scale(d1, t1));
             }
             c_outer_point[2] = 0;
@@ -539,12 +594,14 @@ export class NWayJunctionGenerator {
             const p1_bottom = v_add(this.center, v_scale(Norm[i], HalfW[i] + PaveL[i] - bridge_inset));
             const p2_bottom = v_add(this.center, v_scale(Norm[next_idx], -(HalfW[next_idx] + PaveR[next_idx] - bridge_inset)));
             let c_bottom_point: Vec3;
-            if (Math.abs(det) < 1e-6) {
+            if (Math.abs(det) < 1e-4) {
                 c_bottom_point = v_add(p1_bottom, v_scale(d1, (HalfW[i] + PaveL[i] - bridge_inset) * 2));
             } else {
                 const dx = p2_bottom[0] - p1_bottom[0];
                 const dy = p2_bottom[1] - p1_bottom[1];
-                const t1 = (dx * d2[1] - dy * d2[0]) / det;
+                let t1 = (dx * d2[1] - dy * d2[0]) / det;
+                if (t1 > 50.0) t1 = 50.0;
+                if (t1 < -50.0) t1 = -50.0;
                 c_bottom_point = v_add(p1_bottom, v_scale(d1, t1));
             }
             c_bottom_point[2] = intersection_height - bridge_depth;
@@ -558,7 +615,9 @@ export class NWayJunctionGenerator {
             const proj_R = v_dot(v_sub(C[prev_idx], this.center), D[i]);
             const proj_outer_L = v_dot(v_sub(C_outer[i], this.center), D[i]);
             const proj_outer_R = v_dot(v_sub(C_outer[prev_idx], this.center), D[i]);
-            R.push(Math.max(proj_L, proj_R, proj_outer_L, proj_outer_R) + this.fillet_radius);
+            let r_val = Math.max(proj_L, proj_R, proj_outer_L, proj_outer_R) + this.fillet_radius;
+            if (r_val > 50.0) r_val = 50.0;
+            R.push(r_val);
         }
         
         const MC: Vec3[] = [];
@@ -591,16 +650,41 @@ export class NWayJunctionGenerator {
         const P_center_bottom: Vec3 = [this.center[0], this.center[1], center_z - bridge_depth];
         
         const MC_bottom: Vec3[] = [];
+        let sum_z = 0;
+        const arm_dz: number[] = [];
         for (let i = 0; i < N; i++) {
-            MC[i][2] = center_z;
-            ML[i][2] = center_z;
-            MR[i][2] = center_z;
-            ML_outer[i][2] = center_z;
-            MR_outer[i][2] = center_z;
-            C[i][2] = center_z;
-            C_outer[i][2] = center_z;
+            let z = center_z;
+            let dz = 0;
+            if (sorted_arms[i].getZAtRadius) {
+                const res = sorted_arms[i].getZAtRadius!(R[i]);
+                z = res.z;
+                dz = res.dz;
+            } else {
+                const slope = sorted_arms[i].slope || 0;
+                z = center_z + slope * R[i];
+                dz = slope;
+            }
+            arm_dz.push(dz);
+            MC[i][2] = z;
+            ML[i][2] = z;
+            MR[i][2] = z;
+            ML_outer[i][2] = z;
+            MR_outer[i][2] = z;
+            ML_bottom[i][2] = z - bridge_depth;
+            MR_bottom[i][2] = z - bridge_depth;
+            sum_z += z;
+        }
+        P_center[2] = sum_z / N;
+        P_center_bottom[2] = P_center[2] - bridge_depth;
+
+        for (let i = 0; i < N; i++) {
+            const next_idx = (i + 1) % N;
+            const z = (ML[i][2] + MR[next_idx][2]) / 2;
+            C[i][2] = z;
+            C_outer[i][2] = z;
+            C_bottom[i][2] = z - bridge_depth;
             
-            const mc_b = [MC[i][0], MC[i][1], center_z - bridge_depth] as Vec3;
+            const mc_b = [MC[i][0], MC[i][1], MC[i][2] - bridge_depth] as Vec3;
             MC_bottom.push(mc_b);
         }
         
@@ -611,17 +695,23 @@ export class NWayJunctionGenerator {
             ArcMid.push([
                 0.25 * ML[i][0] + 0.5 * C[i][0] + 0.25 * MR[next_idx][0],
                 0.25 * ML[i][1] + 0.5 * C[i][1] + 0.25 * MR[next_idx][1],
-                center_z
+                (ML[i][2] + C[i][2] * 2 + MR[next_idx][2]) / 4
             ]);
             ArcMid_bottom.push([
                 0.25 * ML_bottom[i][0] + 0.5 * C_bottom[i][0] + 0.25 * MR_bottom[next_idx][0],
                 0.25 * ML_bottom[i][1] + 0.5 * C_bottom[i][1] + 0.25 * MR_bottom[next_idx][1],
-                center_z - bridge_depth
+                (ML_bottom[i][2] + C_bottom[i][2] * 2 + MR_bottom[next_idx][2]) / 4
             ]);
         }
         
         const patches: PatchSpec[] = [];
         
+        const arc_dz: number[] = [];
+        for (let i = 0; i < N; i++) {
+            const next_idx = (i + 1) % N;
+            arc_dz.push((arm_dz[i] + arm_dz[next_idx]) / 2);
+        }
+
         for (let i = 0; i < N; i++) {
             const prev_idx = (i - 1 + N) % N;
             const next_idx = (i + 1) % N;
@@ -632,9 +722,9 @@ export class NWayJunctionGenerator {
             patches.push({
                 name: `Hub Right ${i}`,
                 grid: coons_patch(
-                    sample_linear(P_center, ArcMid[prev_idx], this.hub_div + 1),
+                    create_radial_curve(P_center, ArcMid[prev_idx], arc_dz[prev_idx], this.hub_div + 1),
                     sample_linear(MC[i], MR[i], this.hub_div + 1),
-                    sample_linear(P_center, MC[i], this.hub_div + 1),
+                    create_radial_curve(P_center, MC[i], arm_dz[i], this.hub_div + 1),
                     right_arc_half
                 ),
                 fill_color: "#d4d4d4",
@@ -647,9 +737,9 @@ export class NWayJunctionGenerator {
             patches.push({
                 name: `Hub Right Bottom ${i}`,
                 grid: coons_patch(
-                    sample_linear(P_center_bottom, ArcMid_bottom[prev_idx], this.hub_div + 1),
+                    create_radial_curve(P_center_bottom, ArcMid_bottom[prev_idx], arc_dz[prev_idx], this.hub_div + 1),
                     sample_linear(MC_bottom[i], MR_bottom[i], this.hub_div + 1),
-                    sample_linear(P_center_bottom, MC_bottom[i], this.hub_div + 1),
+                    create_radial_curve(P_center_bottom, MC_bottom[i], arm_dz[i], this.hub_div + 1),
                     right_arc_half_b
                 ),
                 fill_color: "#777777",
@@ -662,10 +752,10 @@ export class NWayJunctionGenerator {
             patches.push({
                 name: `Hub Left ${i}`,
                 grid: coons_patch(
-                    sample_linear(ArcMid[i], P_center, this.hub_div + 1),
+                    create_radial_curve(P_center, ArcMid[i], arc_dz[i], this.hub_div + 1).reverse(),
                     sample_linear(ML[i], MC[i], this.hub_div + 1),
                     left_arc_half,
-                    sample_linear(P_center, MC[i], this.hub_div + 1)
+                    create_radial_curve(P_center, MC[i], arm_dz[i], this.hub_div + 1)
                 ),
                 fill_color: "#d4d4d4",
                 alpha: 1.0
@@ -677,10 +767,10 @@ export class NWayJunctionGenerator {
             patches.push({
                 name: `Hub Left Bottom ${i}`,
                 grid: coons_patch(
-                    sample_linear(ArcMid_bottom[i], P_center_bottom, this.hub_div + 1),
+                    create_radial_curve(P_center_bottom, ArcMid_bottom[i], arc_dz[i], this.hub_div + 1).reverse(),
                     sample_linear(ML_bottom[i], MC_bottom[i], this.hub_div + 1),
                     left_arc_half_b,
-                    sample_linear(P_center_bottom, MC_bottom[i], this.hub_div + 1)
+                    create_radial_curve(P_center_bottom, MC_bottom[i], arm_dz[i], this.hub_div + 1)
                 ),
                 fill_color: "#777777",
                 alpha: 1.0
@@ -742,7 +832,8 @@ export class NWayJunctionGenerator {
         const armData = sorted_arms.map((arm, i) => ({
             id: arm.id,
             R: R[i],
-            MC: MC[i]
+            MC: MC[i],
+            D: D[i]
         }));
         
         return { patches, armData };

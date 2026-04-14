@@ -9,12 +9,21 @@ const TransformControls = DreiTransformControls as any;
 
 type Point3D = [number, number, number];
 type SplineNode3D = { id: string; position: Point3D; handle1: Point3D; handle2: Point3D; topology?: string; };
-type Spline3D = { id: string; name: string; nodes: SplineNode3D[]; closed: boolean; };
+type RoadProperties = {
+  pave_left: number;
+  pave_right: number;
+  bridge_depth: number;
+  bridge_inset: number;
+  curb_height: number;
+  guard_rail_height: number;
+  guard_rail_thickness: number;
+};
+type Spline3D = { id: string; name: string; nodes: SplineNode3D[]; closed: boolean; roadProperties?: RoadProperties; };
 type Mode = 'select' | 'draw' | 'pan';
 
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
-function SplineCenterGizmo({ spline, onUpdate }: any) {
+function SplineCenterGizmo({ spline, onUpdate, isActive, mode, selectedNodeId, onClick }: any) {
   const meshRef = useRef<THREE.Mesh>(null);
   const [isDragging, setIsDragging] = useState(false);
   
@@ -34,33 +43,44 @@ function SplineCenterGizmo({ spline, onUpdate }: any) {
     }
   }, [center, isDragging]);
 
+  const showTransform = isActive && !selectedNodeId && mode === 'select';
+
   return (
     <>
-      <mesh ref={meshRef} visible={false}>
-        <boxGeometry args={[1, 1, 1]} />
+      <mesh 
+        ref={meshRef} 
+        visible={true}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onPointerOver={(e) => { document.body.style.cursor = 'pointer'; }}
+        onPointerOut={(e) => { document.body.style.cursor = 'auto'; }}
+      >
+        <boxGeometry args={[2, 2, 2]} />
+        <meshStandardMaterial color={isActive ? "#44ff44" : "#888888"} />
       </mesh>
-      <TransformControls 
-        object={meshRef} 
-        mode="translate" 
-        onDraggingChanged={(e: any) => setIsDragging(e.value)}
-        onObjectChange={() => {
-          if (meshRef.current) {
-            const curr = meshRef.current.position;
-            const dx = curr.x - prevPos.current.x;
-            const dy = curr.y - prevPos.current.y;
-            const dz = curr.z - prevPos.current.z;
-            if (dx !== 0 || dy !== 0 || dz !== 0) {
-              onUpdate(dx, dy, dz);
-              prevPos.current.copy(curr);
+      {showTransform && (
+        <TransformControls 
+          object={meshRef} 
+          mode="translate" 
+          onDraggingChanged={(e: any) => setIsDragging(e.value)}
+          onObjectChange={() => {
+            if (meshRef.current) {
+              const curr = meshRef.current.position;
+              const dx = curr.x - prevPos.current.x;
+              const dy = curr.y - prevPos.current.y;
+              const dz = curr.z - prevPos.current.z;
+              if (dx !== 0 || dy !== 0 || dz !== 0) {
+                onUpdate(dx, dy, dz);
+                prevPos.current.copy(curr);
+              }
             }
-          }
-        }} 
-      />
+          }} 
+        />
+      )}
     </>
   );
 }
 
-function SplineRenderer({ spline, isActive, selectedNodeId, onNodeClick, mode, onNodeUpdate, onSplineUpdate }: any) {
+function SplineRenderer({ spline, isActive, selectedNodeId, onNodeClick, mode, onNodeUpdate, onSplineUpdate, onSplineClick }: any) {
   const points = useMemo(() => {
     if (spline.nodes.length < 2) return [];
     const curvePath = new THREE.CurvePath<THREE.Vector3>();
@@ -84,9 +104,14 @@ function SplineRenderer({ spline, isActive, selectedNodeId, onNodeClick, mode, o
   return (
     <group>
       {points.length > 0 && <Line points={points} color={isActive ? "#ffffff" : "#666666"} lineWidth={isActive ? 4 : 2} />}
-      {isActive && !selectedNodeId && mode === 'select' && (
-        <SplineCenterGizmo spline={spline} onUpdate={(dx: number, dy: number, dz: number) => onSplineUpdate(spline.id, dx, dy, dz)} />
-      )}
+      <SplineCenterGizmo 
+        spline={spline} 
+        isActive={isActive}
+        mode={mode}
+        selectedNodeId={selectedNodeId}
+        onUpdate={(dx: number, dy: number, dz: number) => onSplineUpdate(spline.id, dx, dy, dz)} 
+        onClick={onSplineClick}
+      />
       {spline.nodes.map((node: SplineNode3D, index: number) => {
         const isSelected = node.id === selectedNodeId;
         const isEndpoint = index === 0 || index === spline.nodes.length - 1;
@@ -214,14 +239,196 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
     const segmentPatches: PatchSpec[] = [];
     const markers: any[] = [];
     
+    // 0. Preprocess splines to find intersections and snaps
+    const processedSplines = JSON.parse(JSON.stringify(splines)) as Spline3D[];
+    const splits: { splineId: string, segIdx: number, t: number, point: Point3D }[] = [];
+    
+    const getCurve = (s: Spline3D, i: number) => {
+        const n1 = s.nodes[i];
+        const n2 = s.nodes[(i + 1) % s.nodes.length];
+        return new THREE.CubicBezierCurve3(
+            new THREE.Vector3(...n1.position),
+            new THREE.Vector3(...n1.handle2),
+            new THREE.Vector3(...n2.handle1),
+            new THREE.Vector3(...n2.position)
+        );
+    };
+
+    // Find crossing intersections
+    for (let i = 0; i < processedSplines.length; i++) {
+        const s1 = processedSplines[i];
+        const len1 = s1.closed ? s1.nodes.length : s1.nodes.length - 1;
+        for (let j = i; j < processedSplines.length; j++) {
+            const s2 = processedSplines[j];
+            const len2 = s2.closed ? s2.nodes.length : s2.nodes.length - 1;
+            
+            for (let seg1 = 0; seg1 < len1; seg1++) {
+                for (let seg2 = (i === j ? seg1 + 2 : 0); seg2 < len2; seg2++) {
+                    if (i === j && (seg1 === seg2 || Math.abs(seg1 - seg2) === 1 || (s1.closed && Math.abs(seg1 - seg2) === len1 - 1))) continue;
+                    
+                    const c1 = getCurve(s1, seg1);
+                    const c2 = getCurve(s2, seg2);
+                    
+                    const pts1 = c1.getPoints(20);
+                    const pts2 = c2.getPoints(20);
+                    
+                    for (let k = 0; k < pts1.length - 1; k++) {
+                        for (let l = 0; l < pts2.length - 1; l++) {
+                            const p1 = pts1[k], p2 = pts1[k+1];
+                            const p3 = pts2[l], p4 = pts2[l+1];
+                            
+                            const denom = (p4.z - p3.z) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.z - p1.z);
+                            if (Math.abs(denom) < 1e-6) continue;
+                            
+                            const ua = ((p4.x - p3.x) * (p1.z - p3.z) - (p4.z - p3.z) * (p1.x - p3.x)) / denom;
+                            const ub = ((p2.x - p1.x) * (p1.z - p3.z) - (p2.z - p1.z) * (p1.x - p3.x)) / denom;
+                            
+                            if (ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1) {
+                                const t1 = (k + ua) / 20;
+                                const t2 = (l + ub) / 20;
+                                
+                                const pt = c1.getPointAt(t1);
+                                const distToN1 = new THREE.Vector3(...s1.nodes[seg1].position).distanceTo(pt);
+                                const distToN2 = new THREE.Vector3(...s1.nodes[(seg1+1)%s1.nodes.length].position).distanceTo(pt);
+                                const distToN3 = new THREE.Vector3(...s2.nodes[seg2].position).distanceTo(pt);
+                                const distToN4 = new THREE.Vector3(...s2.nodes[(seg2+1)%s2.nodes.length].position).distanceTo(pt);
+                                
+                                if (distToN1 > 5.0 && distToN2 > 5.0 && distToN3 > 5.0 && distToN4 > 5.0) {
+                                    const exists = splits.some(sp => new THREE.Vector3(...sp.point).distanceTo(pt) < 5.0);
+                                    if (!exists) {
+                                        splits.push({ splineId: s1.id, segIdx: seg1, t: t1, point: [pt.x, pt.y, pt.z] });
+                                        splits.push({ splineId: s2.id, segIdx: seg2, t: t2, point: [pt.x, pt.y, pt.z] });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find node-to-segment snaps
+    processedSplines.forEach(s1 => {
+        s1.nodes.forEach(node => {
+            const nodePos = new THREE.Vector3(...node.position);
+            let bestDist = 10.0; // Snap distance
+            let bestSnap: any = null;
+            
+            processedSplines.forEach(s2 => {
+                const len2 = s2.closed ? s2.nodes.length : s2.nodes.length - 1;
+                for (let seg2 = 0; seg2 < len2; seg2++) {
+                    if (s1.id === s2.id && (s1.nodes.indexOf(node) === seg2 || s1.nodes.indexOf(node) === (seg2 + 1) % s2.nodes.length)) continue;
+                    
+                    const c2 = getCurve(s2, seg2);
+                    const pts = c2.getPoints(50);
+                    for (let k = 0; k < pts.length; k++) {
+                        const dist = new THREE.Vector2(pts[k].x, pts[k].z).distanceTo(new THREE.Vector2(nodePos.x, nodePos.z));
+                        if (dist < bestDist) {
+                            const t = k / 50;
+                            const pt = c2.getPointAt(t);
+                            const distToN1 = new THREE.Vector3(...s2.nodes[seg2].position).distanceTo(pt);
+                            const distToN2 = new THREE.Vector3(...s2.nodes[(seg2+1)%s2.nodes.length].position).distanceTo(pt);
+                            if (distToN1 > 5.0 && distToN2 > 5.0) {
+                                bestDist = dist;
+                                bestSnap = { splineId: s2.id, segIdx: seg2, t: t, point: [pts[k].x, nodePos.y, pts[k].z] };
+                            }
+                        }
+                    }
+                }
+            });
+            
+            if (bestSnap) {
+                const existingSplit = splits.find(sp => new THREE.Vector3(...sp.point).distanceTo(new THREE.Vector3(...bestSnap.point)) < 5.0);
+                const targetPoint = existingSplit ? existingSplit.point : bestSnap.point;
+                
+                const dx = targetPoint[0] - node.position[0];
+                const dy = targetPoint[1] - node.position[1];
+                const dz = targetPoint[2] - node.position[2];
+                
+                node.position = targetPoint;
+                node.handle1 = [node.handle1[0] + dx, node.handle1[1] + dy, node.handle1[2] + dz];
+                node.handle2 = [node.handle2[0] + dx, node.handle2[1] + dy, node.handle2[2] + dz];
+                
+                if (!existingSplit) {
+                    splits.push(bestSnap);
+                }
+            }
+        });
+    });
+
+    // Apply splits
+    const splitBezier = (p0: Point3D, p1: Point3D, p2: Point3D, p3: Point3D, t: number) => {
+        const lerp = (a: Point3D, b: Point3D, t: number): Point3D => [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t
+        ];
+        const p01 = lerp(p0, p1, t);
+        const p12 = lerp(p1, p2, t);
+        const p23 = lerp(p2, p3, t);
+        const p012 = lerp(p01, p12, t);
+        const p123 = lerp(p12, p23, t);
+        const p0123 = lerp(p012, p123, t);
+        return { left: [p0, p01, p012, p0123], right: [p0123, p123, p23, p3] };
+    };
+
+    processedSplines.forEach(s => {
+        const sSplits = splits.filter(sp => sp.splineId === s.id);
+        if (sSplits.length === 0) return;
+        
+        const splitsBySeg = new Map<number, number[]>();
+        sSplits.forEach(sp => {
+            if (!splitsBySeg.has(sp.segIdx)) splitsBySeg.set(sp.segIdx, []);
+            splitsBySeg.get(sp.segIdx)!.push(sp.t);
+        });
+        
+        const segIndices = Array.from(splitsBySeg.keys()).sort((a, b) => b - a);
+        
+        segIndices.forEach(segIdx => {
+            let ts = splitsBySeg.get(segIdx)!;
+            let uniqueTs: number[] = [];
+            ts.forEach(t => {
+                if (!uniqueTs.some(ut => Math.abs(ut - t) < 0.02)) {
+                    uniqueTs.push(t);
+                }
+            });
+            ts = uniqueTs.sort((a, b) => b - a);
+            
+            let currentMaxT = 1.0;
+            
+            ts.forEach(originalT => {
+                const t = originalT / currentMaxT;
+                currentMaxT = originalT;
+                
+                const n1 = s.nodes[segIdx];
+                const n2 = s.nodes[(segIdx + 1) % s.nodes.length];
+                
+                const split = splitBezier(n1.position, n1.handle2, n2.handle1, n2.position, t);
+                
+                const newNode: SplineNode3D = {
+                    id: generateId(),
+                    position: split.left[3],
+                    handle1: split.left[2],
+                    handle2: split.right[1]
+                };
+                
+                n1.handle2 = split.left[1];
+                n2.handle1 = split.right[2];
+                
+                s.nodes.splice(segIdx + 1, 0, newNode);
+            });
+        });
+    });
+
     // 1. Group nodes into intersections
     const groups: { position: Point3D, nodes: { splineId: string, nodeIndex: number, node: SplineNode3D }[], topology?: string }[] = [];
-    splines.forEach(s => {
+    processedSplines.forEach(s => {
       s.nodes.forEach((n, idx) => {
         const existing = groups.find(g => 
-          Math.abs(g.position[0] - n.position[0]) < 0.1 &&
-          Math.abs(g.position[1] - n.position[1]) < 0.1 &&
-          Math.abs(g.position[2] - n.position[2]) < 0.1
+          Math.abs(g.position[0] - n.position[0]) < 5.0 &&
+          Math.abs(g.position[1] - n.position[1]) < 5.0 &&
+          Math.abs(g.position[2] - n.position[2]) < 5.0
         );
         if (existing) {
           existing.nodes.push({ splineId: s.id, nodeIndex: idx, node: n });
@@ -231,25 +438,60 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
         }
       });
     });
-    
+
+    // Snap grouped nodes to the exact same position
+    groups.forEach(g => {
+        if (g.nodes.length > 1) {
+            // Calculate average position
+            let cx = 0, cy = 0, cz = 0;
+            g.nodes.forEach(({ node }) => {
+                cx += node.position[0];
+                cy += node.position[1];
+                cz += node.position[2];
+            });
+            cx /= g.nodes.length;
+            cy /= g.nodes.length;
+            cz /= g.nodes.length;
+            
+            g.position = [cx, cy, cz];
+            
+            // Move nodes and their handles
+            g.nodes.forEach(({ node }) => {
+                const dx = cx - node.position[0];
+                const dy = cy - node.position[1];
+                const dz = cz - node.position[2];
+                
+                node.position = [cx, cy, cz];
+                node.handle1 = [node.handle1[0] + dx, node.handle1[1] + dy, node.handle1[2] + dz];
+                node.handle2 = [node.handle2[0] + dx, node.handle2[1] + dy, node.handle2[2] + dz];
+            });
+        }
+    });
+
     const intersections = groups.filter(g => g.nodes.length > 1 || g.topology);
     
-    const connectionMap = new Map<string, { R: number, MC: Vec3 }>();
+    const connectionMap = new Map<string, { R: number, MC: Vec3, D: Vec3 }>();
     
     // 2. Generate Junctions
     intersections.forEach((m, i) => {
         const arms: ArmSpec[] = [];
         m.nodes.forEach(({ splineId, nodeIndex, node }) => {
-            const spline = splines.find(s => s.id === splineId);
+            const spline = processedSplines.find(s => s.id === splineId);
             if (!spline) return;
             
             const addArm = (targetNode: SplineNode3D, handlePos: Point3D, isStart: boolean) => {
+                // Do not add an arm if the target node is part of the same intersection
+                const isTargetInGroup = m.nodes.some(gn => gn.node.id === targetNode.id);
+                if (isTargetInGroup) return;
+
                 let dx = handlePos[0] - m.position[0];
                 let dz = handlePos[2] - m.position[2];
+                let dy = handlePos[1] - m.position[1];
                 const dist = Math.sqrt(dx*dx + dz*dz);
                 if (dist < 2.0) {
                     dx = targetNode.position[0] - m.position[0];
                     dz = targetNode.position[2] - m.position[2];
+                    dy = targetNode.position[1] - m.position[1];
                 }
                 const r_dy = -dz;
                 const r_dx = dx;
@@ -264,6 +506,51 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
                 else if (node.topology === '4 Lane Road') width = 16.0;
                 else if (node.topology === 'Highway Interchange') width = 20.0;
 
+                let curve: THREE.CubicBezierCurve3;
+                if (isStart) {
+                    curve = new THREE.CubicBezierCurve3(
+                        new THREE.Vector3(node.position[0], node.position[1], node.position[2]),
+                        new THREE.Vector3(node.handle2[0], node.handle2[1], node.handle2[2]),
+                        new THREE.Vector3(targetNode.handle1[0], targetNode.handle1[1], targetNode.handle1[2]),
+                        new THREE.Vector3(targetNode.position[0], targetNode.position[1], targetNode.position[2])
+                    );
+                } else {
+                    curve = new THREE.CubicBezierCurve3(
+                        new THREE.Vector3(node.position[0], node.position[1], node.position[2]),
+                        new THREE.Vector3(node.handle1[0], node.handle1[1], node.handle1[2]),
+                        new THREE.Vector3(targetNode.handle2[0], targetNode.handle2[1], targetNode.handle2[2]),
+                        new THREE.Vector3(targetNode.position[0], targetNode.position[1], targetNode.position[2])
+                    );
+                }
+
+                const getZAtRadius = (r: number) => {
+                    const center2D = new THREE.Vector2(node.position[0], node.position[2]);
+                    let bestT = 0;
+                    let minDiff = Infinity;
+                    for (let i = 0; i <= 100; i++) {
+                        const t = i / 100;
+                        const p = curve.getPointAt(t);
+                        const p2D = new THREE.Vector2(p.x, p.z);
+                        const d = p2D.distanceTo(center2D);
+                        const diff = Math.abs(d - r);
+                        if (diff < minDiff) {
+                            minDiff = diff;
+                            bestT = t;
+                        }
+                    }
+                    const pt = curve.getPointAt(bestT);
+                    const tan = curve.getTangentAt(bestT);
+                    const tan2D = new THREE.Vector2(tan.x, tan.z);
+                    const tanLen = tan2D.length();
+                    const dz = tanLen > 0 ? tan.y / tanLen : 0;
+                    return { z: pt.y, dz: dz };
+                };
+
+                const props = spline.roadProperties || {
+                    pave_left: 2.0, pave_right: 2.0, bridge_depth: 1.5, bridge_inset: 1.5,
+                    curb_height: 0.15, guard_rail_height: 0.8, guard_rail_thickness: 0.2
+                };
+
                 arms.push({
                     id: `${splineId}-${nodeIndex}-${isStart ? 'start' : 'end'}`,
                     name: `Arm`,
@@ -271,8 +558,10 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
                     outer_height: m.position[1],
                     fill_color: "#333333",
                     width: width,
-                    pavement_width_left: 2.0,
-                    pavement_width_right: 2.0
+                    pavement_width_left: props.pave_left,
+                    pavement_width_right: props.pave_right,
+                    slope: Math.sqrt(dx*dx + dz*dz) > 0 ? dy / Math.sqrt(dx*dx + dz*dz) : 0,
+                    getZAtRadius
                 });
             };
 
@@ -304,14 +593,21 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
                     4, // longitudinal_subdivs
                     5.0 // fillet_radius
                 );
-                const result = generator.build_case(arms, m.position[1], 0.8, 0.2, 1.5, 1.5);
+                const firstSplineId = m.nodes[0].splineId;
+                const firstSpline = processedSplines.find(s => s.id === firstSplineId);
+                const props = firstSpline?.roadProperties || {
+                    pave_left: 2.0, pave_right: 2.0, bridge_depth: 1.5, bridge_inset: 1.5,
+                    curb_height: 0.15, guard_rail_height: 0.8, guard_rail_thickness: 0.2
+                };
+                const result = generator.build_case(arms, m.position[1], props.guard_rail_height, props.guard_rail_thickness, props.bridge_depth, props.bridge_inset);
                 junctionPatches.push(...result.patches);
                 
                 result.armData.forEach(data => {
-                    connectionMap.set(data.id, { R: data.R, MC: data.MC });
+                    connectionMap.set(data.id, { R: data.R, MC: data.MC, D: data.D });
                 });
             } catch (e) {
-                console.error(e);
+                console.error("NWayJunctionGenerator error:", e);
+                markers.push({ position: m.position, topology: "ERROR" });
             }
         }
 
@@ -337,10 +633,27 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
         return 10.0;
     };
 
-    splines.forEach(spline => {
+    processedSplines.forEach(spline => {
         const processSegment = (n1: SplineNode3D, n2: SplineNode3D, idx1: number, idx2: number) => {
-            const width = getWidth(n1.topology || n2.topology);
-            const generator = new RoadSegmentGenerator(width, 2.0, 2.0, 1.5, 1.5, 0.15, 0.8, 0.2);
+            // Do not generate a segment if both nodes are in the same intersection group
+            const group1 = intersections.find(g => g.nodes.some(gn => gn.node.id === n1.id));
+            const group2 = intersections.find(g => g.nodes.some(gn => gn.node.id === n2.id));
+            if (group1 && group2 && group1 === group2) {
+                return;
+            }
+
+            const width1 = getWidth(n1.topology);
+            const width2 = getWidth(n2.topology);
+            const props = spline.roadProperties || {
+                pave_left: 2.0, pave_right: 2.0, bridge_depth: 1.5, bridge_inset: 1.5,
+                curb_height: 0.15, guard_rail_height: 0.8, guard_rail_thickness: 0.2
+            };
+            const generator = new RoadSegmentGenerator(
+                width1, width2, 
+                props.pave_left, props.pave_right, 
+                props.bridge_depth, props.bridge_inset, 
+                props.curb_height, props.guard_rail_height, props.guard_rail_thickness
+            );
             
             const curve = new THREE.CubicBezierCurve3(
                 new THREE.Vector3(n1.position[0], n1.position[1], n1.position[2]),
@@ -359,57 +672,88 @@ function RoadNetwork({ splines }: { splines: Spline3D[] }) {
             const conn1 = connectionMap.get(`${spline.id}-${idx1}-start`);
             const conn2 = connectionMap.get(`${spline.id}-${idx2}-end`);
             
-            let startDist = conn1 ? conn1.R : 0;
-            let endDist = conn2 ? totalLen - conn2.R : totalLen;
-            
-            if (startDist < endDist) {
-                const segmentPoints: [number, number, number][] = [];
-                
-                if (conn1) {
-                    segmentPoints.push([conn1.MC[0], conn1.MC[1], conn1.MC[2]]);
-                } else if (startDist > 0) {
-                    for (let j = 0; j < points.length - 1; j++) {
-                        if (startDist >= lengths[j] && startDist <= lengths[j+1]) {
-                            const t = (startDist - lengths[j]) / (lengths[j+1] - lengths[j]);
-                            const x = points[j].x + (points[j+1].x - points[j].x) * t;
-                            const y = points[j].y + (points[j+1].y - points[j].y) * t;
-                            const z = points[j].z + (points[j+1].z - points[j].z) * t;
-                            segmentPoints.push([x, -z, y]);
-                            break;
-                        }
-                    }
-                } else if (startDist === 0) {
-                    const first = points[0];
-                    segmentPoints.push([first.x, -first.z, first.y]);
-                }
-
+            let startDist = 0;
+            if (conn1) {
+                const center2D = new THREE.Vector2(n1.position[0], n1.position[2]);
                 for (let j = 0; j < points.length; j++) {
-                    if (lengths[j] > startDist && lengths[j] < endDist) {
-                        segmentPoints.push([points[j].x, -points[j].z, points[j].y]);
+                    const p2D = new THREE.Vector2(points[j].x, points[j].z);
+                    if (p2D.distanceTo(center2D) >= conn1.R) {
+                        startDist = lengths[j];
+                        break;
                     }
                 }
+            }
+            
+            let endDist = totalLen;
+            if (conn2) {
+                const center2D = new THREE.Vector2(n2.position[0], n2.position[2]);
+                for (let j = points.length - 1; j >= 0; j--) {
+                    const p2D = new THREE.Vector2(points[j].x, points[j].z);
+                    if (p2D.distanceTo(center2D) >= conn2.R) {
+                        endDist = lengths[j];
+                        break;
+                    }
+                }
+            }
+            
+            if (startDist >= endDist) {
+                return;
+            }
 
+            const segmentPoints: [number, number, number][] = [];
+            
+            if (conn1) {
+                segmentPoints.push([conn1.MC[0], conn1.MC[1], conn1.MC[2]]);
+            } else if (startDist > 0) {
+                for (let j = 0; j < points.length - 1; j++) {
+                    if (startDist >= lengths[j] && startDist <= lengths[j+1]) {
+                        const t = (startDist - lengths[j]) / (lengths[j+1] - lengths[j]);
+                        const x = points[j].x + (points[j+1].x - points[j].x) * t;
+                        const y = points[j].y + (points[j+1].y - points[j].y) * t;
+                        const z = points[j].z + (points[j+1].z - points[j].z) * t;
+                        segmentPoints.push([x, -z, y]);
+                        break;
+                    }
+                }
+            } else if (startDist === 0) {
+                const first = points[0];
+                segmentPoints.push([first.x, -first.z, first.y]);
+            }
+
+            for (let j = 0; j < points.length; j++) {
+                if (lengths[j] > startDist && lengths[j] < endDist) {
+                    segmentPoints.push([points[j].x, -points[j].z, points[j].y]);
+                }
+            }
+
+            if (conn2) {
+                segmentPoints.push([conn2.MC[0], conn2.MC[1], conn2.MC[2]]);
+            } else if (endDist < totalLen) {
+                for (let j = 0; j < points.length - 1; j++) {
+                    if (endDist >= lengths[j] && endDist <= lengths[j+1]) {
+                        const t = (endDist - lengths[j]) / (lengths[j+1] - lengths[j]);
+                        const x = points[j].x + (points[j+1].x - points[j].x) * t;
+                        const y = points[j].y + (points[j+1].y - points[j].y) * t;
+                        const z = points[j].z + (points[j+1].z - points[j].z) * t;
+                        segmentPoints.push([x, -z, y]);
+                        break;
+                    }
+                }
+            } else if (endDist === totalLen) {
+                const last = points[points.length - 1];
+                segmentPoints.push([last.x, -last.z, last.y]);
+            }
+
+            if (segmentPoints.length >= 2) {
+                let startDir: Vec3 | undefined = undefined;
+                let endDir: Vec3 | undefined = undefined;
+                if (conn1) {
+                    startDir = conn1.D;
+                }
                 if (conn2) {
-                    segmentPoints.push([conn2.MC[0], conn2.MC[1], conn2.MC[2]]);
-                } else if (endDist < totalLen) {
-                    for (let j = 0; j < points.length - 1; j++) {
-                        if (endDist >= lengths[j] && endDist <= lengths[j+1]) {
-                            const t = (endDist - lengths[j]) / (lengths[j+1] - lengths[j]);
-                            const x = points[j].x + (points[j+1].x - points[j].x) * t;
-                            const y = points[j].y + (points[j+1].y - points[j].y) * t;
-                            const z = points[j].z + (points[j+1].z - points[j].z) * t;
-                            segmentPoints.push([x, -z, y]);
-                            break;
-                        }
-                    }
-                } else if (endDist === totalLen) {
-                    const last = points[points.length - 1];
-                    segmentPoints.push([last.x, -last.z, last.y]);
+                    endDir = [-conn2.D[0], -conn2.D[1], -conn2.D[2]];
                 }
-
-                if (segmentPoints.length >= 2) {
-                    segmentPatches.push(...generator.build_segment(segmentPoints).patches);
-                }
+                segmentPatches.push(...generator.build_segment(segmentPoints, startDir, endDir).patches);
             }
         };
 
@@ -664,6 +1008,7 @@ export default function App() {
               isActive={spline.id === activeSplineId} selectedNodeId={selectedNodeId}
               onNodeClick={handleNodeClick} onNodeUpdate={updateNode}
               onSplineUpdate={updateSplinePosition}
+              onSplineClick={() => { setActiveSplineId(spline.id); setMode('select'); }}
             />
           ))}
           <RoadNetwork splines={splines} />
@@ -712,6 +1057,7 @@ export default function App() {
           <Settings className="w-5 h-5" /> <h2 className="font-semibold tracking-wide">Properties</h2>
         </div>
         <div className="p-5 flex-1 overflow-y-auto space-y-6">
+
           {selectedSpline && (
             <div className="space-y-4">
               <h3 className="text-xs font-bold text-[#888888] uppercase flex items-center gap-2"><Route className="w-4 h-4" /> Spline</h3>
@@ -719,6 +1065,43 @@ export default function App() {
                 <input type="checkbox" checked={selectedSpline.closed} onChange={e => setSplines(prev => prev.map(s => s.id === selectedSpline.id ? { ...s, closed: e.target.checked } : s))} className="rounded bg-[#0a0a0a] border-[#444444]" />
                 <span className="text-sm">Closed Loop</span>
               </label>
+
+              <div className="space-y-2 pt-2">
+                <h4 className="text-[10px] font-bold text-[#666666] uppercase tracking-wider">Road Properties</h4>
+                
+                {[
+                  { key: 'pave_left', label: 'Pavement Left', default: 2.0 },
+                  { key: 'pave_right', label: 'Pavement Right', default: 2.0 },
+                  { key: 'curb_height', label: 'Curb Height', default: 0.15 },
+                  { key: 'bridge_depth', label: 'Bridge Depth', default: 1.5 },
+                  { key: 'bridge_inset', label: 'Bridge Inset', default: 1.5 },
+                  { key: 'guard_rail_height', label: 'Guard Rail Height', default: 0.8 },
+                  { key: 'guard_rail_thickness', label: 'Guard Rail Thickness', default: 0.2 },
+                ].map(prop => (
+                  <div key={prop.key} className="flex items-center justify-between gap-2">
+                    <label className="text-xs text-[#888888]">{prop.label}</label>
+                    <input 
+                      type="number" 
+                      step="0.1"
+                      value={selectedSpline.roadProperties?.[prop.key as keyof RoadProperties] ?? prop.default}
+                      onChange={e => {
+                        const val = parseFloat(e.target.value);
+                        setSplines(prev => prev.map(s => {
+                          if (s.id === selectedSpline.id) {
+                            const currentProps = s.roadProperties || {
+                              pave_left: 2.0, pave_right: 2.0, bridge_depth: 1.5, bridge_inset: 1.5,
+                              curb_height: 0.15, guard_rail_height: 0.8, guard_rail_thickness: 0.2
+                            };
+                            return { ...s, roadProperties: { ...currentProps, [prop.key]: val } };
+                          }
+                          return s;
+                        }));
+                      }}
+                      className="w-16 bg-[#0a0a0a] border border-[#444444] rounded px-2 py-1 text-xs text-white outline-none focus:border-[#888888]"
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
           )}
           {selectedNode && (
